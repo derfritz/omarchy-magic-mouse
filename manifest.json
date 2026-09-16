@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.maikunari.magic-mouse",
   "name": "Magic Mouse for Omarchy",
-  "version": "1.1.3",
+  "version": "1.2.0",
   "author": "Mike Sewell",
   "license": "MIT",
   "description": "Make an Apple Magic Mouse feel like a Mac: Apple's pointer curve, sane scrolling, momentum, gestures, battery in the bar and a settings popup",

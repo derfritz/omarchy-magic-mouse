@@ -5,6 +5,6 @@ rm -f "$HOME/.config/systemd/user/magic-mouse.service" "$HOME/.local/bin/magic-m
 systemctl --user daemon-reload
 omarchy plugin disable io.github.maikunari.magic-mouse 2>/dev/null || true
 # The plugin checkout itself is left for `omarchy plugin remove io.github.maikunari.magic-mouse`.
-sudo rm -f /etc/udev/rules.d/70-magic-mouse.rules /etc/modprobe.d/hid_magicmouse.conf && sudo udevadm control --reload
+sudo rm -f /etc/udev/rules.d/70-magic-mouse.rules /etc/modprobe.d/hid_magicmouse.conf /etc/modules-load.d/magic-mouse.conf && sudo udevadm control --reload
 echo "removed daemon, unit, udev rule, driver options and the bar widget."
 echo "kept: ~/.config/magic-mouse/config.toml, the 'omarchy-magic-mouse' block in ~/.config/hypr/input.lua, and the plugin checkout (omarchy plugin remove io.github.maikunari.magic-mouse)."

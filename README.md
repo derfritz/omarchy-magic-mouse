@@ -28,13 +28,22 @@ A small daemon grabs the real mouse and re-emits a virtual one called
   tolerance freezes the cursor for a moment after a press so the click itself
   can't nudge it.
 - **Scroll:** synthesized from the touch surface, ignoring the kernel wheel.
-  A finger must travel about a millimetre before a scroll starts, and a scroll
-  can't start until the pointer has been still for a moment (drift happens while
-  you're still aiming; real scrolls happen after the hand stops). One axis at a
-  time, natural direction, and the scroll rate ramps with finger speed.
+  A finger must travel about a millimetre, and be clearly moving, before a
+  scroll starts. Fingers that only hold the mouse don't count: a touch that
+  lands on the side edge is a grip, and among several fingers the one that
+  slides scrolls (two sliding together scroll too). While the mouse itself
+  moves, a scroll only starts if the finger slides several times farther than
+  the mouse travels, so a resting finger drifting as you aim never scrolls,
+  and a scroll stops once you start mousing. No scroll starts right around a
+  click. One axis at a time, natural direction, and the scroll rate ramps with
+  finger speed.
 - **Momentum:** flick and lift, the page glides and eases out.
 - **Clicks:** the kernel driver's centre "middle-click" zone (which pastes on
-  Linux) is a left click, like on a Mac. Configurable.
+  Linux) is a left click, like on a Mac. Configurable. Control-click as a
+  right click is a switch in the settings popup (`buttons.control_click`):
+  the daemon never reads the keyboard, so it adds a Hyprland binding for
+  Control + click on its virtual mouse only and answers it with a right click.
+  While it is on, apps no longer see Control + click from the Magic Mouse.
 - **Gestures:** one-finger sideways flick = back / forward (browser buttons).
   Two-finger sideways swipe = previous / next workspace. One- and two-finger
   double taps are hooks you can point at any Hyprland dispatcher or command.
@@ -58,9 +67,11 @@ Hyprland only needs a flat profile for the virtual device; the installer adds it
 |---|---|
 | Pointer acceleration | Apple's curve, same numbers |
 | Natural scrolling | yes |
-| Scroll starts only when you mean it | start threshold + settle rule |
+| Scroll starts only when you mean it | start threshold, resting and gripping fingers ignored, finger-vs-mouse motion |
 | Momentum scrolling | yes (`momentum.decay` 0.984 matches Apple's rate) |
 | Secondary click on the right side | done by the mouse itself |
+| Secondary click off | `buttons.right_click = false` (switch in the popup) |
+| Control-click = secondary click | `buttons.control_click = true` (switch in the popup) |
 | No middle click | `buttons.middle = "left"` |
 | Swipe between pages (one finger) | back / forward buttons |
 | Swipe between full-screen apps (two fingers) | workspace switch (`hl.dsp.focus({ workspace = "e+1" })`) |
@@ -141,11 +152,12 @@ Everything is listed so you can decide before running it:
 | `~/.config/hypr/input.lua` (or `input.conf`) | a 7-line device block, **appended only after asking**, with a backup |
 | `/etc/udev/rules.d/70-magic-mouse.rules` | via the root helper: a `uaccess` rule for the mouse's input and raw HID nodes and for `/dev/uinput`, matched by device ID |
 | `/etc/modprobe.d/hid_magicmouse.conf` | via the root helper: `emulate_3button=0` |
+| `/etc/modules-load.d/magic-mouse.conf` | via the root helper: loads `uinput` at boot so the rule above can apply |
 
 No file from the checkout runs as root. The only privileged step is a short
 Python helper embedded in `install.sh` and handed to the distro's `python3` on
 the command line, so it is already in memory when `sudo` runs and nothing on
-disk can be swapped in afterwards. It carries the exact bytes of both `/etc`
+disk can be swapped in afterwards. It carries the exact bytes of all three `/etc`
 files, walks to each directory one component at a time without following
 symlinks, requires root-owned directories that only root can write to, writes
 to an exclusive temporary file there, verifies it through the same descriptor,
@@ -168,7 +180,7 @@ socket, and writes its status under `$XDG_RUNTIME_DIR/magic-mouse/`.
 
 ## Notes
 
-- Works with Magic Mouse 1 (`05ac:030d`) and Magic Mouse 2 / USB‑C (`004c:0269`),
+- Works with Magic Mouse 1 (`05ac:030d`), Magic Mouse 2 (`004c:0269`) and Magic Mouse USB‑C (`004c:0323`),
   matched by ID, so it does not matter what you named the mouse on macOS.
 - Requires `python-evdev` (installed by `install.sh`) and the in-kernel
   `hid_magicmouse` driver, which Arch ships.

@@ -16,13 +16,15 @@ invert_y = false     # flip if forward/back is reversed on your model
 invert_x = false
 speed = 1.0
 start_mm = 0.8       # finger must travel this far (mm) before a scroll starts
-settle_ms = 150      # a scroll can't start until the pointer has been still this long...
-settle_counts = 4    # ...where "still" allows this many raw counts of wobble in that window
+settle_ms = 150      # the mouse counts as moving if it moved within this long...
+settle_counts = 4    # ...by more than this many raw counts. While it moves, the finger must slide 3x farther to scroll
 accel = 0.6          # 0 = linear, 1 = strong ramp with finger speed
 horizontal = true
 
 [buttons]
 middle = "left"      # click in the centre zone: "left" (macOS has no middle click), "middle" (paste on Linux), "right"
+right_click = true   # click on the right side = right click. false = left click everywhere (macOS "Secondary click: Off")
+control_click = false  # Control + click = right click, like macOS. Takes Control + click away from apps, for this mouse only
 
 [gestures]
 swipe_pages = true   # quick one-finger sideways flick = back / forward in browsers

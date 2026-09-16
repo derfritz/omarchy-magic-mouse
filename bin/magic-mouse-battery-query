@@ -11,7 +11,7 @@ import fcntl, glob, os, struct, sys
 def hidraw_for_magic_mouse():
     for p in sorted(glob.glob('/sys/class/hidraw/hidraw*')):
         ue = open(f'{p}/device/uevent').read()
-        if 'HID_ID=0005:0000004C:00000269' in ue or 'HID_ID=0005:000005AC:0000030D' in ue:
+        if any(i in ue for i in ('HID_ID=0005:0000004C:00000269', 'HID_ID=0005:0000004C:00000323', 'HID_ID=0005:000005AC:0000030D')):
             return '/dev/' + os.path.basename(p)
     return None
 

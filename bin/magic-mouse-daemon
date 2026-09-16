@@ -9,7 +9,8 @@ a virtual mouse called "magic-mouse-omarchy" with:
             does not creep while you press.
   scroll    synthesized from the touch surface (the kernel's emulated wheel is
             ignored): a finger has to travel a little before scrolling starts,
-            scrolling never starts while the pointer is moving, one axis at a
+            resting and gripping fingers are ignored, a finger has to slide
+            well beyond what the mouse itself moves, one axis at a
             time, natural direction, speed ramps with finger speed.
   momentum  flick and lift: the page keeps going and eases out.
 
@@ -19,6 +20,7 @@ Config: ~/.config/magic-mouse/config.toml (hot-reloaded on save).
 from __future__ import annotations
 
 import argparse
+import array
 import collections
 import fcntl
 import glob
@@ -26,6 +28,7 @@ import json
 import math
 import os
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -38,7 +41,7 @@ from evdev import InputDevice, UInput, ecodes as e
 
 VIRT_NAME = "magic-mouse-omarchy"
 APPLE_VENDORS = {0x004C, 0x05AC}
-MAGIC_MOUSE_PRODUCTS = {0x030D, 0x0269}  # Magic Mouse 1, Magic Mouse 2
+MAGIC_MOUSE_PRODUCTS = {0x030D, 0x0269, 0x0323}  # Magic Mouse 1, Magic Mouse 2, Magic Mouse USB-C
 CONFIG_PATH = os.path.expanduser(
     os.environ.get("MAGIC_MOUSE_CONFIG", "~/.config/magic-mouse/config.toml")
 )
@@ -55,6 +58,44 @@ TICK_HZ = 125
 TICK = 1.0 / TICK_HZ
 RESCAN_SEC = 2.0
 NOMINAL_DT = 0.011  # Magic Mouse reports at ~90 Hz
+SCROLL_SPEED_MS = 40.0  # smoothing window for the finger speed that drives the scroll ramp
+SCROLL_VEL_MS = 60.0  # smoothing window for the wheel velocity momentum starts from
+# Which finger scrolls. Holding the mouse leaves fingers resting on the surface
+# (typically one on the far edge and one near the left button), and a flick
+# pushes the mouse a little. Measured on a Magic Mouse USB-C: scroll strokes
+# slide >= 4x (mostly >10x) farther than the mouse moves; resting fingers drift
+# < 2x the mouse's own travel.
+EDGE_MM = 6.0  # a touch that lands this close to the left or right edge is a finger holding the mouse
+MOVE_WINDOW = 0.12  # seconds; "is this finger moving" looks this far back
+MOVING_MM = 0.5  # travel within MOVE_WINDOW that makes a finger moving rather than resting
+MIN_SLIDE_MM = 1.0  # while the mouse moves, a scroll needs this much slide within MOVE_WINDOW...
+POINTER_RATIO = 3.0  # ...and this many times the distance the mouse itself moved
+CLICK_QUIET = 0.25  # seconds around a press or release in which no scroll starts (a pressing finger rolls)
+
+
+def EVIOCGMTSLOTS(length: int) -> int:
+    return (2 << 30) | (length << 16) | (ord("E") << 8) | 0x0A
+
+
+class Touch:
+    """One finger on the surface, from landing to lift."""
+
+    __slots__ = ("x", "y", "grip", "hist")
+
+    def __init__(self, ts: float, x: int, y: int, grip: bool) -> None:
+        self.x, self.y, self.grip = x, y, grip
+        self.hist: collections.deque = collections.deque([(ts, x, y)])
+
+    def update(self, ts: float, x: int, y: int) -> None:
+        self.x, self.y = x, y
+        self.hist.append((ts, x, y))
+        while len(self.hist) > 2 and self.hist[1][0] <= ts - MOVE_WINDOW:
+            self.hist.popleft()
+
+    def recent(self) -> tuple[int, int]:
+        """Displacement in touch units over (about) the last MOVE_WINDOW."""
+        _, x, y = self.hist[0]
+        return self.x - x, self.y - y
 
 DEFAULTS = {
     "pointer": {
@@ -71,13 +112,15 @@ DEFAULTS = {
         "invert_x": False,
         "speed": 1.0,
         "start_mm": 0.8,  # finger must travel this far before scrolling starts
-        "settle_ms": 150.0,  # no scroll start until the pointer has been still this long...
-        "settle_counts": 4.0,  # ...where "moving" means more than this many raw counts in that window
+        "settle_ms": 150.0,  # the mouse counts as moving if it moved within this long...
+        "settle_counts": 4.0,  # ...by more than this many raw counts (then a scroll needs POINTER_RATIO more slide)
         "accel": 0.6,  # 0 = linear, 1 = strong ramp with finger speed
         "horizontal": True,
     },
     "buttons": {
         "middle": "left",  # a click in the centre zone: "left" (macOS has no middle click), "middle", or "right"
+        "right_click": True,  # a click on the right side is a right click; false = left click (macOS "Secondary click: Off")
+        "control_click": False,  # Control + click = right click, like macOS (a Hyprland binding on the virtual mouse only)
     },
     "gestures": {
         "swipe_pages": True,  # quick one-finger sideways flick = browser back / forward
@@ -397,6 +440,112 @@ def hypr_socket() -> str | None:
     return max(socks, key=os.path.getmtime) if socks else None
 
 
+def hypr_request(cmd: str, timeout: float = 0.5) -> str | None:
+    """One synchronous request on Hyprland's command socket; None if it can't be reached."""
+    sock = hypr_socket()
+    if not sock:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX) as c:
+            c.settimeout(timeout)
+            c.connect(sock)
+            c.sendall(cmd.encode())
+            out = b""
+            while chunk := c.recv(4096):
+                out += chunk
+            return out.decode("utf-8", "replace")
+    except OSError as exc:
+        log(f"hyprland: {exc}")
+        return None
+
+
+# Control-click = right click. Hyprland knows the keyboard's modifiers; this
+# daemon deliberately never reads the keyboard. So Hyprland gets a binding for
+# Control + left press, limited to our virtual mouse, whose only effect is to
+# swallow that press and post an event on its event socket. The daemon answers
+# it with a right click on the same virtual device, so the click is routed
+# like any real one (window under the cursor, layer surfaces, menus).
+CONTROL_CLICK_EVENT = "custom>>magic-mouse>>control-click"
+_LUA_UNBIND = ("if _G.magic_mouse_control_click then pcall(function() _G.magic_mouse_control_click:unbind() end) "
+               "_G.magic_mouse_control_click = nil end")
+_LUA_BIND = (_LUA_UNBIND + ' _G.magic_mouse_control_click = hl.bind("CTRL + mouse:272", '
+             'hl.dsp.event("magic-mouse>>control-click"), '
+             f'{{ device = {{ inclusive = true, list = {{ "{VIRT_NAME}" }} }}, '
+             'description = "Magic Mouse: Control-click is a right click" })')
+
+
+class HyprEvents:
+    """Hyprland's event socket (.socket2.sock) plus the Control-click binding it serves."""
+
+    RETRY_SEC = 5.0
+
+    def __init__(self) -> None:
+        self.sock: socket.socket | None = None
+        self.buf = b""
+        self.next_try = 0.0
+        self.bound: bool | None = None  # what Hyprland currently has, as far as we know
+        self.next_sync = 0.0  # after a failed attempt, don't retry before this
+        self.warned = False
+
+    def fileno(self) -> int:
+        return self.sock.fileno() if self.sock else -1
+
+    def connect(self, now: float) -> None:
+        if self.sock or now < self.next_try:
+            return
+        self.next_try = now + self.RETRY_SEC
+        cmd = hypr_socket()
+        if not cmd:
+            return
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.connect(os.path.join(os.path.dirname(cmd), ".socket2.sock"))
+            s.setblocking(False)
+        except OSError:
+            return
+        self.sock, self.buf = s, b""
+        self.resync()  # a new connection may be a new Hyprland
+
+    def resync(self) -> None:
+        self.bound = None
+        self.next_sync = 0.0
+
+    def close(self) -> None:
+        if self.sock:
+            self.sock.close()
+        self.sock = None
+        self.bound = None
+
+    def read_lines(self) -> list[str]:
+        try:
+            chunk = self.sock.recv(65536)
+        except BlockingIOError:
+            return []
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self.close()
+            return []
+        self.buf += chunk
+        *lines, self.buf = self.buf.split(b"\n")
+        return [l.decode("utf-8", "replace") for l in lines]
+
+    def sync_binding(self, want: bool, now: float) -> None:
+        """Called every loop pass; only talks to Hyprland when something changed."""
+        if self.sock is None or self.bound == want or now < self.next_sync:
+            return
+        reply = hypr_request("eval " + (_LUA_BIND if want else _LUA_UNBIND))
+        if reply is None or reply.strip() != "ok":
+            self.next_sync = now + self.RETRY_SEC
+            if reply is not None and want and not self.warned:
+                log(f"control_click: Hyprland refused the binding (needs Lua-config Hyprland): {reply.strip()}")
+                self.warned = True
+            return
+        if want or self.bound:  # at startup, clearing a leftover from an earlier run is not news
+            log("control_click binding " + ("added" if want else "removed"))
+        self.bound = want
+
+
 def run_action(cmd: str) -> None:
     """'dispatch ...' / 'keyword ...' go straight to Hyprland's socket; anything else is a shell command.
 
@@ -435,13 +584,22 @@ class Engine:
         self.cfg = cfg
         self.ui = ui
         self.verbose = verbose
+        self.record = None  # --record: raw input events, one "ts type code value" line each
         self.curve = AppleCurve(float(cfg["pointer"]["tracking_speed"]))
         self.res_x = TOUCH_UNITS_PER_MM
         self.res_y = TOUCH_UNITS_PER_MM
+        self.dev: InputDevice | None = None
+        self.dropped = False  # SYN_DROPPED seen: skip to the next SYN_REPORT, then resync
+        self.x_min, self.x_max = -1100, 1258  # touch X range; read from the device on attach
         # frame accumulators
         self.f_dx = 0
         self.f_dy = 0
         self.f_btn: list[tuple[int, int]] = []
+        # buttons
+        self.pressed: dict[int, int] = {}  # physical button -> code we pressed on the virtual device
+        self.left_press_t = -1.0
+        self.last_button_t = -1.0
+        self.right_latched = False  # a Control-click right press, released with the physical button
         # pointer
         self.v = 0.0
         self.last_motion_t = -1.0
@@ -449,17 +607,19 @@ class Engine:
         self.rem_y = 0.0
         self.hold_until = 0.0
         self.hold_acc = [0.0, 0.0]
-        self.recent: collections.deque = collections.deque()  # (ts, raw distance) for the settle rule
+        self.recent: collections.deque = collections.deque()  # (ts, raw distance): how much the mouse itself moved lately
         # touch
         self.slots: dict[int, list] = {}  # slot -> [tracking_id, x, y]
         self.cur_slot = 0
-        self.primary: int | None = None
+        self.touches: dict[int, Touch] = {}  # tracking_id -> Touch
+        self.primary: tuple[int, ...] | None = None  # the finger (or two) being followed
         self.t_ref: tuple[int, int] | None = None
         self.scrolling = False
         self.axis = "y"
         self.s_rem = 0.0
         self.s_notch = 0
         self.s_vel = 0.0
+        self.s_speed = 0.0  # smoothed finger speed, mm/s
         self.s_last_t = -1.0
         self.s_travel = 0.0  # signed mm along the locked axis this scroll
         self.scroll_t0 = 0.0
@@ -470,6 +630,8 @@ class Engine:
         self.session_clicked = False
         self.max_fingers = 0
         self.gesture_fired = False
+        self.session_scrolled = False
+        self.two_key: tuple[int, ...] | None = None
         self.two_ref: tuple[float, float] | None = None
         self.last_tap_t = -1.0
         self.last_tap_fingers = 0
@@ -477,31 +639,62 @@ class Engine:
         self.coasting = False
         self.c_vel = 0.0
         self.c_t0 = 0.0
+        self.c_last_t = 0.0
 
     # ---- device attach
     def attach(self, dev: InputDevice) -> None:
+        self.dev = dev
         self.reset_touch()
         self.v = 0.0
         self.last_motion_t = -1.0
+        try:
+            info = dev.absinfo(e.ABS_MT_POSITION_X)
+            self.x_min, self.x_max = info.min, info.max
+        except OSError:
+            pass
+        self.sync_mt()
 
     def reset_touch(self) -> None:
         self.slots.clear()
+        self.touches.clear()
         self.cur_slot = 0
         self.primary = None
         self.t_ref = None
         self.scrolling = False
         self.session_open = False
+        self.two_key = None
         self.two_ref = None
         self.stop_coast("reset")
+
+    def sync_mt(self) -> None:
+        """Load the kernel's current multitouch state. Events only carry changes, so
+        without this the first touch after a grab (or after dropped events) is filed
+        under the wrong slot, and a finger that never lifts is left behind: every
+        real touch then looks like a second finger and nothing scrolls."""
+        if self.dev is None:
+            return
+        try:
+            info = self.dev.absinfo(e.ABS_MT_SLOT)
+            n = info.max + 1
+            cols = {}
+            for code in (e.ABS_MT_TRACKING_ID, e.ABS_MT_POSITION_X, e.ABS_MT_POSITION_Y):
+                buf = array.array("i", [code] + [0] * n)
+                fcntl.ioctl(self.dev.fd, EVIOCGMTSLOTS(len(buf) * buf.itemsize), buf, True)
+                cols[code] = buf[1:]
+        except OSError as exc:
+            log(f"touch state: {exc}")
+            return
+        self.slots = {
+            i: [cols[e.ABS_MT_TRACKING_ID][i], cols[e.ABS_MT_POSITION_X][i], cols[e.ABS_MT_POSITION_Y][i]]
+            for i in range(n) if cols[e.ABS_MT_TRACKING_ID][i] >= 0
+        }
+        self.cur_slot = info.value
 
     def update_config(self, cfg: dict) -> None:
         self.cfg = cfg
         self.curve = AppleCurve(float(cfg["pointer"]["tracking_speed"]))
 
     # ---- helpers
-    def fingers(self) -> list[int]:
-        return sorted(s for s, v in self.slots.items() if v[0] >= 0)
-
     def pointer_gain(self, v: float) -> float:
         """Pixels per raw count at smoothed speed v (raw counts/ms), macOS style."""
         p = self.cfg["pointer"]
@@ -532,9 +725,18 @@ class Engine:
 
     # ---- event intake
     def feed(self, ev) -> None:
+        if self.record:
+            self.record.write(f"{ev.timestamp():.6f} {ev.type} {ev.code} {ev.value}\n")
         if ev.type == e.EV_SYN:
-            if ev.code == e.SYN_REPORT:
-                self.process_frame(ev.timestamp())
+            if ev.code == e.SYN_DROPPED:
+                self.dropped = True  # the kernel's buffer overflowed; state is unknown
+            elif ev.code == e.SYN_REPORT:
+                if self.dropped:
+                    self.resync(ev.timestamp())
+                else:
+                    self.process_frame(ev.timestamp())
+            return
+        if self.dropped:
             return
         if ev.type == e.EV_REL:
             if ev.code == e.REL_X:
@@ -560,6 +762,18 @@ class Engine:
                     slot[2] = ev.value
             return
 
+    def resync(self, ts: float) -> None:
+        """After SYN_DROPPED: reload touches and release buttons whose release was lost."""
+        self.dropped = False
+        self.f_dx = self.f_dy = 0
+        self.sync_mt()
+        try:
+            down = set(self.dev.active_keys()) if self.dev else set(self.pressed)
+        except OSError:
+            down = set(self.pressed)
+        self.f_btn = [(phys, 0) for phys in self.pressed if phys not in down]
+        self.process_frame(ts)
+
     # ---- per-frame processing
     def process_frame(self, ts: float) -> None:
         dx, dy, btns = self.f_dx, self.f_dy, self.f_btn
@@ -568,14 +782,24 @@ class Engine:
 
         # buttons first, so motion in the press frame is covered by click tolerance
         clicked = False
-        for code, value in btns:
-            code = self.map_button(code)
+        for phys, value in btns:
+            self.last_button_t = ts
             if value == 1:
+                code = self.map_button(phys)
+                self.pressed[phys] = code
                 clicked = True
                 self.stop_coast("button")
                 self.hold_until = ts + float(self.cfg["pointer"]["click_hold_ms"]) / 1000.0
                 self.hold_acc = [0.0, 0.0]
+                if code == e.BTN_LEFT:
+                    self.left_press_t = ts
+            else:
+                # release what was pressed, even if buttons.middle changed in between
+                code = self.pressed.pop(phys, self.map_button(phys))
             self.ui.write(e.EV_KEY, code, value)
+            if value == 0 and code == e.BTN_LEFT and self.right_latched:
+                self.ui.write(e.EV_KEY, e.BTN_RIGHT, 0)
+                self.right_latched = False
 
         if dx or dy:
             self.pointer(ts, dx, dy)
@@ -594,6 +818,9 @@ class Engine:
         self.last_motion_t = ts
         dist = math.hypot(dx, dy)
         self.recent.append((ts, dist))
+        keep = max(float(self.cfg["scroll"]["settle_ms"]) / 1000.0, MOVE_WINDOW)
+        while self.recent and self.recent[0][0] < ts - keep:
+            self.recent.popleft()
         # Smoothed velocity. A burst frame (dt ~ 0) gets ~zero weight, so it
         # cannot spike the estimate the way it does inside libinput.
         if dt > 0:
@@ -619,10 +846,37 @@ class Engine:
         self.emit_rel(e.REL_Y, iy)
 
     def map_button(self, code: int) -> int:
+        if code == e.BTN_RIGHT and self.cfg["buttons"]["right_click"] is False:
+            return e.BTN_LEFT  # and with control_click on, Control + that click is still a right click
         if code != e.BTN_MIDDLE:
             return code
         want = str(self.cfg["buttons"]["middle"]).lower()
         return {"left": e.BTN_LEFT, "right": e.BTN_RIGHT}.get(want, e.BTN_MIDDLE)
+
+    def control_click(self, now: float) -> None:
+        """Hyprland swallowed a Control + left press on our device: answer with a right click.
+        Held for as long as the physical button is, so press-drag-release in a menu works."""
+        if not self.cfg["buttons"]["control_click"] or self.right_latched:
+            return
+        if self.left_press_t < 0 or now - self.left_press_t > 1.0:
+            return  # no recent left press of ours; stale or foreign event
+        self.left_press_t = -1.0
+        held = e.BTN_LEFT in self.pressed.values()
+        self.ui.write(e.EV_KEY, e.BTN_RIGHT, 1)
+        if held:
+            self.right_latched = True
+        else:
+            self.ui.write(e.EV_KEY, e.BTN_RIGHT, 0)  # the click was quicker than the round trip
+        self.ui.syn()
+
+    def release_buttons(self) -> None:
+        """Mouse gone: never leave a button held down on the virtual device."""
+        for code in set(self.pressed.values()) | ({e.BTN_RIGHT} if self.right_latched else set()):
+            self.ui.write(e.EV_KEY, code, 0)
+        if self.pressed or self.right_latched:
+            self.ui.syn()
+        self.pressed.clear()
+        self.right_latched = False
 
     def nav(self, back: bool) -> None:
         code = e.BTN_SIDE if back else e.BTN_EXTRA
@@ -634,17 +888,37 @@ class Engine:
             log("swipe: " + ("back" if back else "forward"))
 
     def pointer_moving(self, ts: float) -> bool:
-        """Settle rule: has the pointer really moved within the last settle_ms?"""
+        """Has the mouse itself really moved within the last settle_ms?"""
         s = self.cfg["scroll"]
         cut = ts - float(s["settle_ms"]) / 1000.0
         while self.recent and self.recent[0][0] < cut:
             self.recent.popleft()
         return sum(d for _, d in self.recent) > float(s["settle_counts"])
 
+    def pointer_mm(self, ts: float, window: float) -> float:
+        """How far the mouse itself moved, in mm, within the last `window` seconds."""
+        counts = sum(d for t, d in self.recent if t >= ts - window)
+        return counts * 25.4 / max(float(self.cfg["pointer"]["cpi"]), 1.0)
+
     def touch(self, ts: float) -> None:
-        active = self.fingers()
-        n = len(active)
-        if n == 0:
+        live = {v[0]: (v[1], v[2]) for v in self.slots.values() if v[0] >= 0}
+        for tid in [t for t in self.touches if t not in live]:
+            del self.touches[tid]
+        edge = EDGE_MM * self.res_x
+        for tid, (x, y) in live.items():
+            t = self.touches.get(tid)
+            if t is None:
+                grip = x <= self.x_min + edge or x >= self.x_max - edge
+                self.touches[tid] = Touch(ts, x, y, grip)
+                if not grip:
+                    self.stop_coast("touch")
+            else:
+                t.update(ts, x, y)
+        if self.scrolling and not all(t in live for t in self.primary or ()):
+            self.end_scroll(ts)  # the scrolling finger lifted; resting fingers may stay down
+
+        fingers = sorted(tid for tid, t in self.touches.items() if not t.grip)
+        if not fingers:
             if self.session_open:
                 self.end_session(ts)
             return
@@ -653,26 +927,56 @@ class Engine:
             self.session_t0 = ts
             self.session_travel = 0.0
             self.session_clicked = False
+            self.session_scrolled = False
             self.max_fingers = 0
             self.gesture_fired = False
-            self.two_ref = None
+            self.two_key = None
             self.primary = None
             self.stop_coast("touch")
-        self.max_fingers = max(self.max_fingers, n)
-        if n >= 2:
-            self.two_fingers(ts, active)
-        else:
-            self.one_finger(ts, active[0])
+        self.max_fingers = max(self.max_fingers, len(fingers))
+        key = self.pick(fingers)
+        if key is None:
+            self.primary = None  # everything is resting: nothing to follow
+            self.t_ref = None
+            return
+        if len(key) == 2:
+            self.two_fingers(key)
+        x = sum(self.touches[t].x for t in key) / len(key)
+        y = sum(self.touches[t].y for t in key) / len(key)
+        self.follow(ts, key, x, y)
 
-    def two_fingers(self, ts: float, active: list[int]) -> None:
+    def pick(self, fingers: list[int]) -> tuple[int, ...] | None:
+        """The finger(s) to follow: a scroll in progress keeps its own; otherwise the
+        one that moves while the others rest, or two moving the same way."""
+        def down(key: tuple[int, ...] | None) -> bool:
+            return bool(key) and all(t in self.touches for t in key)
+
+        if self.scrolling and down(self.primary):
+            return self.primary
+        if len(fingers) == 1:
+            return (fingers[0],)
+        moves = sorted(((math.hypot(*self.touches[t].recent()) / self.res_x, t) for t in fingers), reverse=True)
+        (m1, t1), (m2, t2) = moves[0], moves[1]
+        if m1 < MOVING_MM:
+            return self.primary if down(self.primary) else None
+        if m2 >= MOVING_MM and m2 >= 0.5 * m1:
+            (ax, ay), (bx, by) = self.touches[t1].recent(), self.touches[t2].recent()
+            if ax * bx + ay * by > 0:
+                return tuple(sorted((t1, t2)))  # two fingers moving together
+            return None  # moving apart: a pinch, not a scroll
+        return (t1,)
+
+    def key_recent_mm(self, key: tuple[int, ...]) -> float:
+        vx = sum(self.touches[t].recent()[0] for t in key) / len(key) / self.res_x
+        vy = sum(self.touches[t].recent()[1] for t in key) / len(key) / self.res_y
+        return math.hypot(vx, vy)
+
+    def two_fingers(self, pair: tuple[int, ...]) -> None:
         g = self.cfg["gestures"]
-        if self.scrolling:
-            self.scrolling = False  # two fingers never scroll (as on macOS)
-        self.primary = None
-        self.t_ref = None
-        cx = sum(self.slots[i][1] for i in active) / len(active)
-        cy = sum(self.slots[i][2] for i in active) / len(active)
-        if self.two_ref is None:
+        cx = sum(self.touches[t].x for t in pair) / 2
+        cy = sum(self.touches[t].y for t in pair) / 2
+        if self.two_key != pair:
+            self.two_key = pair
             self.two_ref = (cx, cy)
             return
         dx_mm = (cx - self.two_ref[0]) / self.res_x
@@ -687,14 +991,12 @@ class Engine:
                 log("two-finger swipe " + ("left" if dx_mm < 0 else "right"))
             run_action(str(action))
 
-    def one_finger(self, ts: float, primary: int) -> None:
+    def follow(self, ts: float, key: tuple[int, ...], x: float, y: float) -> None:
         s = self.cfg["scroll"]
-        _, x, y = self.slots[primary]
-        if primary != self.primary or self.t_ref is None:
-            # a finger just landed (or we came back from two fingers): re-anchor, no scroll yet
-            self.primary = primary
+        if key != self.primary or self.t_ref is None:
+            # a finger landed or started moving (or the pair changed): re-anchor, no scroll yet
+            self.primary = key
             self.t_ref = (x, y)
-            self.scrolling = False
             self.s_vel = 0.0
             self.s_last_t = ts
             return
@@ -705,41 +1007,66 @@ class Engine:
         self.session_travel += math.hypot(dx_mm, dy_mm)
 
         if not self.scrolling:
-            if self.pointer_moving(ts):
-                self.t_ref = (x, y)  # resting finger while mousing: never a scroll
-                return
-            if math.hypot(dx_mm, dy_mm) < float(s["start_mm"]):
-                return
-            self.axis = "x" if abs(dx_mm) > HORIZONTAL_RATIO * abs(dy_mm) else "y"
-            if self.axis == "x" and not s["horizontal"]:
+            if self.pressed or ts - self.last_button_t < CLICK_QUIET:
                 self.t_ref = (x, y)
                 return
+            if self.pointer_moving(ts):
+                # The mouse is moving. A resting finger drifts a little with it; a finger
+                # that scrolls slides much farther on the surface than the mouse travels
+                # (a flick pushes the mouse too). Judge by the last MOVE_WINDOW only.
+                vx = sum(self.touches[t].recent()[0] for t in key) / len(key) / self.res_x
+                vy = sum(self.touches[t].recent()[1] for t in key) / len(key) / self.res_y
+                slide = math.hypot(vx, vy)
+                if slide < max(float(s["start_mm"]), MIN_SLIDE_MM) or slide < POINTER_RATIO * self.pointer_mm(ts, MOVE_WINDOW):
+                    self.t_ref = (x, y)
+                    return
+                dx_mm, dy_mm = vx, vy
+            elif math.hypot(dx_mm, dy_mm) < float(s["start_mm"]) or self.key_recent_mm(key) < MOVING_MM:
+                return  # not far enough yet, or only creeping: a resting finger rolls and drifts slowly
+            self.axis = "x" if abs(dx_mm) > HORIZONTAL_RATIO * abs(dy_mm) else "y"
+            if self.axis == "x" and (not s["horizontal"] or len(key) == 2):
+                self.t_ref = (x, y)  # sideways with two fingers is the workspace gesture
+                return
             self.scrolling = True
+            self.session_scrolled = True
             self.scroll_t0 = ts
             self.s_travel = 0.0
             self.t_ref = (x, y)  # the start travel is swallowed, like macOS
             self.s_vel = 0.0
+            self.s_speed = 0.0
+            self.s_rem = 0.0
+            self.s_notch = 0
             self.s_last_t = ts
             if self.verbose:
-                log(f"scroll start axis={self.axis}")
+                log(f"scroll start axis={self.axis} fingers={len(key)}")
             return
 
         # scrolling
         self.t_ref = (x, y)
-        d_mm = dy_mm if self.axis == "y" else dx_mm
-        if d_mm == 0.0:
+        pointer = self.pointer_mm(ts, MOVE_WINDOW)
+        if pointer >= MIN_SLIDE_MM and pointer > self.key_recent_mm(key):
+            # the mouse moves farther than the finger slides: this is mousing now, not
+            # scrolling (a resting finger wiggles as the hand pushes). Stop, no glide.
+            self.scrolling = False
+            if self.verbose:
+                log("scroll stop (pointer moving)")
             return
+        d_mm = dy_mm if self.axis == "y" else dx_mm
         self.s_travel += d_mm
-        dt = max(ts - self.s_last_t, 0.001)
+        dt = max(ts - self.s_last_t, 0.0)
         self.s_last_t = ts
-        speed_mm_s = abs(d_mm) / dt
-        ramp = 1.0 + float(s["accel"]) * min(max((speed_mm_s - 75.0) / 370.0, 0.0), 2.0)
+        # Both estimates are smoothed with each report weighted by its dt, like the
+        # pointer's velocity: Bluetooth delivers reports in bursts, and a burst
+        # (dt ~ 0) must not read as a very fast finger. Still frames count too, so
+        # a finger that stops before lifting has no momentum left.
+        k_speed = 1.0 - math.exp(-(dt * 1000.0) / SCROLL_SPEED_MS)
+        k_vel = 1.0 - math.exp(-(dt * 1000.0) / SCROLL_VEL_MS)
+        self.s_speed += k_speed * ((abs(d_mm) / dt if dt > 0 else 0.0) - self.s_speed)
+        ramp = 1.0 + float(s["accel"]) * min(max((self.s_speed - 75.0) / 370.0, 0.0), 2.0)
         sign = self.scroll_sign(self.axis)
         hires = sign * d_mm * HIRES_PER_MM * float(s["speed"]) * ramp
         self.emit_scroll(hires, self.axis)
-        inst = hires / dt
-        a = 1.0 - math.exp(-(dt * 1000.0) / 60.0)
-        self.s_vel += a * (inst - self.s_vel)
+        self.s_vel += k_vel * ((hires / dt if dt > 0 else 0.0) - self.s_vel)
 
     def scroll_sign(self, axis: str) -> float:
         """Map finger travel (touch units) to wheel sign.
@@ -761,25 +1088,35 @@ class Engine:
             sign = -sign
         return sign
 
-    def end_session(self, ts: float) -> None:
+    def end_scroll(self, ts: float) -> None:
         g = self.cfg["gestures"]
         m = self.cfg["momentum"]
+        # the lift report comes one report after the last move; only a longer gap means the finger had stopped
+        self.s_vel *= math.exp(-max(ts - self.s_last_t - NOMINAL_DT, 0.0) * 1000.0 / SCROLL_VEL_MS)
+        swipe = (
+            self.axis == "x" and g["swipe_pages"]
+            and (ts - self.scroll_t0) < 0.4 and abs(self.s_travel) >= float(g["swipe_mm"])
+        )
+        if swipe:
+            self.nav(back=self.s_travel > 0)  # finger moving right = back, like macOS
+        elif m["enabled"] and abs(self.s_vel) >= float(m["flick"]):
+            self.coasting = True
+            self.c_vel = self.s_vel
+            self.c_t0 = ts
+            self.c_last_t = ts
+            self.s_rem = 0.0
+            if self.verbose:
+                log(f"coast start {self.c_vel:.0f} hires/s axis={self.axis}")
+        self.scrolling = False
+        self.primary = None
+        self.t_ref = None
+
+    def end_session(self, ts: float) -> None:
+        g = self.cfg["gestures"]
         dur = ts - self.session_t0
         if self.scrolling:
-            swipe = (
-                self.axis == "x" and g["swipe_pages"]
-                and (ts - self.scroll_t0) < 0.4 and abs(self.s_travel) >= float(g["swipe_mm"])
-            )
-            if swipe:
-                self.nav(back=self.s_travel > 0)  # finger moving right = back, like macOS
-            elif m["enabled"] and abs(self.s_vel) >= float(m["flick"]):
-                self.coasting = True
-                self.c_vel = self.s_vel
-                self.c_t0 = ts
-                self.s_rem = 0.0
-                if self.verbose:
-                    log(f"coast start {self.c_vel:.0f} hires/s axis={self.axis}")
-        elif (not self.session_clicked and not self.gesture_fired
+            self.end_scroll(ts)
+        elif (not self.session_clicked and not self.gesture_fired and not self.session_scrolled
               and self.session_travel < 2.0 and dur < 0.3):
             # a tap (touch without click or travel); two in a row is a double tap
             if self.last_tap_t >= 0 and ts - self.last_tap_t < 0.4 and self.last_tap_fingers == self.max_fingers:
@@ -810,13 +1147,20 @@ class Engine:
         if now - self.c_t0 > float(m["max_seconds"]) or abs(self.c_vel) < float(m["stop"]):
             self.stop_coast("decay")
             return
-        self.emit_scroll(self.c_vel * TICK, self.axis)
+        # Integrate over the time that really passed: the loop also wakes for mouse
+        # reports and can run late, and a fixed step per call would make the glide
+        # speed up, slow down and stutter with that. `decay` stays "per 8 ms tick".
+        dt = min(max(now - self.c_last_t, 0.0), 0.05)
+        self.c_last_t = now
+        if dt == 0.0:
+            return
+        self.emit_scroll(self.c_vel * dt, self.axis)
         self.ui.syn()
-        self.c_vel *= float(m["decay"])
+        self.c_vel *= float(m["decay"]) ** (dt / TICK)
 
 
 # --------------------------------------------------------------------------- main loop
-def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str) -> None:
+def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: HyprEvents) -> None:
     log(f"grab {dev.path} ({dev.name} {dev.info.vendor:04x}:{dev.info.product:04x})")
     dev.grab()
     eng.attach(dev)
@@ -838,16 +1182,25 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str) -> Non
                     log(f"battery {percent}%" + (" charging" if charging else ""))
                 elif hidraw is None:
                     log("battery: no hidraw node found for the mouse")
+            hypr.connect(now)
+            hypr.sync_binding(bool(eng.cfg["buttons"]["control_click"]), now)
             timeout = TICK if eng.coasting else 0.25
-            r, _, _ = select.select([dev.fd], [], [], timeout)
+            fds = [dev.fd] + ([hypr] if hypr.sock else [])
+            r, _, _ = select.select(fds, [], [], timeout)
             now = time.monotonic()
-            if r:
+            if dev.fd in r:
                 try:
                     for ev in dev.read():
                         eng.feed(ev)
                 except OSError as exc:
                     log(f"device gone: {exc}")
                     return
+            if hypr in r:
+                for line in hypr.read_lines():
+                    if line == CONTROL_CLICK_EVENT:
+                        eng.control_click(time.time())
+                    elif line.startswith("configreloaded>>"):
+                        hypr.resync()  # a reload drops bindings added at runtime
             if eng.coasting:
                 eng.tick(time.time())
             if now >= next_cfg_check:
@@ -858,6 +1211,7 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str) -> Non
                     eng.update_config(load_config(cfg_path))
                     log("config reloaded")
     finally:
+        eng.release_buttons()
         for fn in (dev.ungrab, dev.close):
             try:
                 fn()
@@ -873,6 +1227,7 @@ def main() -> int:
     ap.add_argument("--config", default=CONFIG_PATH, help="TOML config path")
     ap.add_argument("--verbose", action="store_true", help="log scroll starts and momentum")
     ap.add_argument("--list", action="store_true", help="show detected Magic Mouse and exit")
+    ap.add_argument("--record", metavar="PATH", help="append the mouse's raw input events to PATH (for debugging)")
     args = ap.parse_args()
 
     if args.list:
@@ -888,6 +1243,13 @@ def main() -> int:
     ui = make_uinput()
     log(f"virtual device '{VIRT_NAME}' ready")
     eng = Engine(cfg, ui, args.verbose)
+    if args.record:
+        eng.record = open(args.record, "a", buffering=1)
+        log(f"recording raw input to {args.record}")
+    hypr = HyprEvents()
+    # systemctl stop sends SIGTERM; exit through the finally blocks so buttons
+    # are released and the Control-click binding is taken back out of Hyprland.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         while True:
             dev = find_mouse()
@@ -895,11 +1257,14 @@ def main() -> int:
                 time.sleep(RESCAN_SEC)
                 continue
             eng.update_config(load_config(args.config))
-            run_session(dev, ui, eng, args.config)
+            run_session(dev, ui, eng, args.config, hypr)
             time.sleep(RESCAN_SEC)
     except KeyboardInterrupt:
         log("interrupt")
     finally:
+        if hypr.sock and hypr.bound:
+            hypr.sync_binding(False, time.monotonic())
+        hypr.close()
         ui.close()
     return 0
 

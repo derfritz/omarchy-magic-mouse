@@ -4,7 +4,7 @@
 # Privilege model: no file from this checkout is ever executed as root. The
 # only privileged step is one fixed Python helper embedded below (see the
 # comment above it), run by the distro's python3; it carries the exact bytes
-# of the two /etc files and installs them atomically with fail-closed checks.
+# of the three /etc files and installs them atomically with fail-closed checks.
 # Access to the mouse comes from the device-specific uaccess udev rule alone:
 # the installer never changes group membership, and stops if the rule did not
 # take effect.
@@ -47,6 +47,7 @@ fi
 # ---------------------------------------------------------------------------
 udev_path=/etc/udev/rules.d/70-magic-mouse.rules
 modprobe_path=/etc/modprobe.d/hid_magicmouse.conf
+modules_path=/etc/modules-load.d/magic-mouse.conf
 root_helper=$(cat <<'PY'
 import hashlib, os, stat, subprocess, sys
 
@@ -55,10 +56,12 @@ UDEV = b"""# omarchy-magic-mouse: grant the logged-in user access to the Magic M
 # changes, no world-readable nodes; only these device IDs.
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="004c", ATTRS{id/product}=="0269", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="004c", ATTRS{id/product}=="0323", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="004c", ATTRS{id/product}=="030d", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="05ac", ATTRS{id/product}=="030d", TAG+="uaccess"
 # Raw HID node too, so the daemon can ask the mouse for its battery level.
 SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0269.*", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0323.*", TAG+="uaccess"
 SUBSYSTEM=="hidraw", KERNELS=="0005:05AC:030D.*", TAG+="uaccess"
 """
 MODPROBE = b"""# omarchy-magic-mouse: let the mouse's own firmware decide left vs right click
@@ -66,9 +69,15 @@ MODPROBE = b"""# omarchy-magic-mouse: let the mouse's own firmware decide left v
 # invent a middle button that macOS never had.
 options hid_magicmouse emulate_3button=0
 """
+MODULES = b"""# omarchy-magic-mouse: load uinput at boot so the udev rule can grant access to
+# /dev/uinput. Until the module is loaded that node is a root-only placeholder,
+# and opening it as the user can't trigger the autoload.
+uinput
+"""
 TARGETS = (
     (("etc", "udev", "rules.d"), "70-magic-mouse.rules", UDEV),
     (("etc", "modprobe.d"), "hid_magicmouse.conf", MODPROBE),
+    (("etc", "modules-load.d"), "magic-mouse.conf", MODULES),
 )
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -164,23 +173,25 @@ except FileNotFoundError:
 else:
     os.write(pfd, b"0\n")
     os.close(pfd)
-try:
-    os.lstat("/dev/uinput")
-except FileNotFoundError:
-    subprocess.run(["/usr/bin/modprobe", "uinput"], check=True)
+# Always load it: /dev/uinput exists as a static placeholder even when the module
+# is not loaded, and then there is no device for the rule to apply to.
+subprocess.run(["/usr/bin/modprobe", "uinput"], check=True)
 subprocess.run(["/usr/bin/udevadm", "control", "--reload"], check=True)
 subprocess.run(["/usr/bin/udevadm", "trigger", "--subsystem-match=misc", "--subsystem-match=input",
                 "--subsystem-match=hidraw", "--action=add"], check=False)
+# The ACL checks in install.sh run right after this; let udev finish first.
+subprocess.run(["/usr/bin/udevadm", "settle", "--timeout=10"], check=False)
 print(" ".join(digests))
 PY
 )
 
 [ -t 0 ] || die "the root step uses sudo and needs a terminal: run ./install.sh from an interactive shell inside your desktop session"
-say "root step (needs your password): the helper embedded in install.sh writes $udev_path and $modprobe_path atomically, then reloads udev"
+say "root step (needs your password): the helper embedded in install.sh writes $udev_path, $modprobe_path and $modules_path atomically, loads uinput, then reloads udev"
 digests="$(sudo /usr/bin/python3 -I -c "$root_helper")"
-read -r udev_sha modprobe_sha <<<"$digests"
+read -r udev_sha modprobe_sha modules_sha <<<"$digests"
 [ "$(sha256sum "$udev_path" | cut -d' ' -f1)" = "$udev_sha" ]         || die "$udev_path does not match what the helper wrote"
 [ "$(sha256sum "$modprobe_path" | cut -d' ' -f1)" = "$modprobe_sha" ] || die "$modprobe_path does not match what the helper wrote"
+[ "$(sha256sum "$modules_path" | cut -d' ' -f1)" = "$modules_sha" ]   || die "$modules_path does not match what the helper wrote"
 
 # Fail closed: the uaccess ACL must actually have reached the device nodes.
 acl_help="uaccess ACLs are granted by systemd-logind to the active seat session. Run install.sh from a terminal inside your Hyprland session (not over SSH), and check: getfacl /dev/uinput"
@@ -189,7 +200,7 @@ for dev in /sys/class/input/event*; do
   [ -e "$dev/device/id/vendor" ] || continue
   vid=$(<"$dev/device/id/vendor"); pid=$(<"$dev/device/id/product")
   case "$vid:$pid" in
-    004c:0269|004c:030d|05ac:030d)
+    004c:0269|004c:0323|004c:030d|05ac:030d)
       node="/dev/input/${dev##*/}"
       [ -r "$node" ] || die "your user cannot read $node (the Magic Mouse) after installing the udev rule. $acl_help"
       ;;

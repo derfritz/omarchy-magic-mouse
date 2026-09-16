@@ -33,9 +33,11 @@ Panel {
     root.refresh()
     Qt.callLater(function() { if (root.opened) setCenterHoverRevealSuppressed(true) })
   }
+  // Hide first: if anything after this throws, the full-screen overlay must
+  // still go away, or it keeps eating every click on every monitor.
   function close() {
-    setCenterHoverRevealSuppressed(false)
     root.controller.hide()
+    setCenterHoverRevealSuppressed(false)
   }
   function toggle() {
     if (root.opened) root.close()
@@ -46,8 +48,15 @@ Panel {
       return root.bar.switchPanelFrom(root.barIdentity, direction)
     return false
   }
+  // On Omarchy 4.0.3+ third-party widgets get PluginBarApi, where
+  // centerHoverRevealSuppressed is read-only and assigning it throws; go
+  // through its setter. On older Omarchy `bar` is the raw Bar, which has the
+  // writable property but no setter, so fall back to assigning it directly
+  // (same shape as Omarchy's own weather/clock panels).
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
+    if (root.bar && typeof root.bar.setCenterHoverRevealSuppressed === "function")
+      root.bar.setCenterHoverRevealSuppressed(value)
+    else if (root.bar && "centerHoverRevealSuppressed" in root.bar)
       root.bar.centerHoverRevealSuppressed = value
   }
 
@@ -238,6 +247,21 @@ Panel {
           minimum: 0; maximum: 3; step: 0.0625
           value: root.val("pointer", "tracking_speed", 0.6875)
           onChanged: function(v) { root.set("pointer", "tracking_speed", Math.round(v * 10000) / 10000) }
+        }
+
+        // ---------- Clicking ----------
+        PanelSectionHeader { text: "CLICKING"; foreground: root.fg; fontFamily: root.fontFam }
+        SwitchRow {
+          label: "Right-side click is a right click"
+          description: "Off: the whole mouse left-clicks, like macOS with secondary click off"
+          checked: root.val("buttons", "right_click", true) === true
+          onToggled: root.set("buttons", "right_click", !(root.val("buttons", "right_click", true) === true))
+        }
+        SwitchRow {
+          label: "Control-click is a right click"
+          description: "Hold Control and click to open menus, like on a Mac"
+          checked: root.val("buttons", "control_click", false) === true
+          onToggled: root.set("buttons", "control_click", !(root.val("buttons", "control_click", false) === true))
         }
 
         // ---------- Scrolling ----------
