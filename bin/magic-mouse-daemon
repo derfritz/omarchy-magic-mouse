@@ -71,6 +71,11 @@ MOVING_MM = 0.5  # travel within MOVE_WINDOW that makes a finger moving rather t
 MIN_SLIDE_MM = 1.0  # while the mouse moves, a scroll needs this much slide within MOVE_WINDOW...
 POINTER_RATIO = 3.0  # ...and this many times the distance the mouse itself moved
 CLICK_QUIET = 0.25  # seconds around a press or release in which no scroll starts (a pressing finger rolls)
+# hid-magicmouse never sets INPUT_MT_DROP_UNUSED and never calls input_mt_sync_frame
+# for the mouse. A HID touch report lists every live contact; a motion-only packet
+# (MOUSE2 size 8) lists none. A 1–2 report tracking-id flicker or TOUCH_STATE_NONE
+# then looks like a lift unless we expire unmentioned slots and bridge a brief gap.
+BRIDGE_MS = 0.06
 
 
 def EVIOCGMTSLOTS(length: int) -> int:
@@ -611,6 +616,9 @@ class Engine:
         # touch
         self.slots: dict[int, list] = {}  # slot -> [tracking_id, x, y]
         self.cur_slot = 0
+        self.mt_frame = False  # this SYN_REPORT included ABS_MT_* (a HID touch report)
+        self.mt_seen: set[int] = set()  # slots mentioned in this touch report
+        self.pending_lift: float | None = None  # apparent lift; end scroll if nothing returns within BRIDGE_MS
         self.touches: dict[int, Touch] = {}  # tracking_id -> Touch
         self.primary: tuple[int, ...] | None = None  # the finger (or two) being followed
         self.t_ref: tuple[int, int] | None = None
@@ -658,6 +666,9 @@ class Engine:
         self.slots.clear()
         self.touches.clear()
         self.cur_slot = 0
+        self.mt_frame = False
+        self.mt_seen.clear()
+        self.pending_lift = None
         self.primary = None
         self.t_ref = None
         self.scrolling = False
@@ -730,6 +741,7 @@ class Engine:
         if ev.type == e.EV_SYN:
             if ev.code == e.SYN_DROPPED:
                 self.dropped = True  # the kernel's buffer overflowed; state is unknown
+                log("SYN_DROPPED")
             elif ev.code == e.SYN_REPORT:
                 if self.dropped:
                     self.resync(ev.timestamp())
@@ -750,9 +762,14 @@ class Engine:
                 self.f_btn.append((ev.code, ev.value))
             return
         if ev.type == e.EV_ABS:
+            # A HID touch report lists every live contact. Remember which slots
+            # were addressed so process_frame can treat the rest as lifts; the
+            # kernel will not (no INPUT_MT_DROP_UNUSED on this device).
+            self.mt_frame = True
             if ev.code == e.ABS_MT_SLOT:
                 self.cur_slot = ev.value
-            else:
+            self.mt_seen.add(self.cur_slot)
+            if ev.code != e.ABS_MT_SLOT:
                 slot = self.slots.setdefault(self.cur_slot, [-1, 0, 0])
                 if ev.code == e.ABS_MT_TRACKING_ID:
                     slot[0] = ev.value
@@ -765,6 +782,8 @@ class Engine:
     def resync(self, ts: float) -> None:
         """After SYN_DROPPED: reload touches and release buttons whose release was lost."""
         self.dropped = False
+        self.mt_frame = False
+        self.mt_seen.clear()
         self.f_dx = self.f_dy = 0
         self.sync_mt()
         try:
@@ -776,6 +795,17 @@ class Engine:
 
     # ---- per-frame processing
     def process_frame(self, ts: float) -> None:
+        if self.mt_frame:
+            # Motion-only packets (no ABS_MT) must not expire slots: those HID
+            # reports simply omit touch data. A real touch report is the full set.
+            stale = [s for s in self.slots if s not in self.mt_seen or self.slots[s][0] < 0]
+            if stale and self.verbose:
+                log(f"touch: drop slots {stale}")
+            for s in stale:
+                del self.slots[s]
+        self.mt_frame = False
+        self.mt_seen.clear()
+
         dx, dy, btns = self.f_dx, self.f_dy, self.f_btn
         self.f_dx = self.f_dy = 0
         self.f_btn = []
@@ -914,14 +944,23 @@ class Engine:
                     self.stop_coast("touch")
             else:
                 t.update(ts, x, y)
-        if self.scrolling and not all(t in live for t in self.primary or ()):
-            self.end_scroll(ts)  # the scrolling finger lifted; resting fingers may stay down
 
         fingers = sorted(tid for tid, t in self.touches.items() if not t.grip)
         if not fingers:
-            if self.session_open:
+            # A 1–2 report dropout (TOUCH_STATE_NONE, or the kernel leaving a
+            # slot up because it never syncs unused contacts) looks like a lift.
+            # Wait BRIDGE_MS before ending the scroll so a flicker can hand off.
+            if self.scrolling:
+                if self.pending_lift is None:
+                    self.pending_lift = ts
+                if ts - self.pending_lift < BRIDGE_MS:
+                    return
+                self.end_session(self.pending_lift)
+                self.pending_lift = None
+            elif self.session_open:
                 self.end_session(ts)
             return
+        self.pending_lift = None
         if not self.session_open:
             self.session_open = True
             self.session_t0 = ts
@@ -936,6 +975,8 @@ class Engine:
         self.max_fingers = max(self.max_fingers, len(fingers))
         key = self.pick(fingers)
         if key is None:
+            if self.scrolling:
+                self.end_scroll(ts)
             self.primary = None  # everything is resting: nothing to follow
             self.t_ref = None
             return
@@ -953,6 +994,8 @@ class Engine:
 
         if self.scrolling and down(self.primary):
             return self.primary
+        if self.scrolling and len(fingers) == 1:
+            return (fingers[0],)  # tracking id changed; keep the remaining finger
         if len(fingers) == 1:
             return (fingers[0],)
         moves = sorted(((math.hypot(*self.touches[t].recent()) / self.res_x, t) for t in fingers), reverse=True)
@@ -994,10 +1037,15 @@ class Engine:
     def follow(self, ts: float, key: tuple[int, ...], x: float, y: float) -> None:
         s = self.cfg["scroll"]
         if key != self.primary or self.t_ref is None:
-            # a finger landed or started moving (or the pair changed): re-anchor, no scroll yet
+            # a finger landed or started moving (or the pair changed): re-anchor.
+            # If we were already scrolling, this is a tracking-id handoff: stay
+            # in the scroll so a 1-report dropout does not swallow start_mm.
+            if self.scrolling and self.verbose and key != self.primary:
+                log(f"scroll handoff {self.primary} -> {key}")
             self.primary = key
             self.t_ref = (x, y)
-            self.s_vel = 0.0
+            if not self.scrolling:
+                self.s_vel = 0.0
             self.s_last_t = ts
             return
 
