@@ -38,19 +38,43 @@ BarWidget {
   // Quickshell exposes UPower's percentage as a 0..1 fraction.
   // The magic-mouse daemon asks the mouse directly and publishes the answer
   // here; UPower only learns the level when the mouse volunteers it.
+  //
+  // The shell never opens that file itself: it lives in a runtime directory
+  // other software can write to, and a FIFO or huge file put in its place would
+  // stall or exhaust the shell. Instead a short-lived child (status-reader.py)
+  // does the opening and prints the status only if the directory is ours and not
+  // group/other-writable and the file is a regular, user-owned file of at most
+  // 4 KiB; otherwise it prints nothing. The child is asynchronous, so even a
+  // wedged one cannot block the shell's event loop; `timeout` reaps it, and only
+  // one runs at a time. Its output is length-checked again below.
   property var status: null
-  FileView {
-    path: Quickshell.env("XDG_RUNTIME_DIR") + "/magic-mouse/battery.json"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.parseStatus(text())
-    onLoadFailed: root.status = null
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string readerScript: decodeURIComponent(Qt.resolvedUrl("status-reader.py").toString().replace(/^file:\/\//, ""))
+  readonly property int maxStatusChars: 4096
+  Process {
+    id: statusProc
+    command: ["timeout", "-k", "1", "3", "python3", "-I", root.readerScript, root.runtimeDir + "/magic-mouse/battery.json"]
+    stdout: StdioCollector {
+      onStreamFinished: root.parseStatus(text)
+    }
+    onExited: function(code) { if (code !== 0) root.status = null }
+  }
+  Timer {
+    interval: 5000
+    repeat: true
+    running: root.runtimeDir !== ""
+    triggeredOnStart: true
+    onTriggered: if (!statusProc.running) statusProc.running = true
   }
   function parseStatus(content) {
     try {
-      var parsed = JSON.parse(String(content || ""))
-      root.status = parsed && typeof parsed === "object" ? parsed : null
+      var raw = String(content || "")
+      if (raw.length === 0 || raw.length > root.maxStatusChars) {
+        root.status = null
+        return
+      }
+      var parsed = JSON.parse(raw)
+      root.status = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null
     } catch (e) {
       root.status = null
     }
