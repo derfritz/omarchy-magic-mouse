@@ -46,7 +46,10 @@ BarWidget {
   // group/other-writable and the file is a regular, user-owned file of at most
   // 4 KiB; otherwise it prints nothing. The child is asynchronous, so even a
   // wedged one cannot block the shell's event loop; `timeout` reaps it, and only
-  // one runs at a time. Its output is length-checked again below.
+  // one runs at a time. Its output is length-checked again below. It runs on
+  // start, every 60 s (the daemon polls the battery at most once a minute), and
+  // whenever the status directory changes; that watch is on the directory only
+  // and never loads anything.
   property var status: null
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
   readonly property string readerScript: decodeURIComponent(Qt.resolvedUrl("status-reader.py").toString().replace(/^file:\/\//, ""))
@@ -59,12 +62,19 @@ BarWidget {
     }
     onExited: function(code) { if (code !== 0) root.status = null }
   }
+  function refreshStatus() { if (root.runtimeDir !== "" && !statusProc.running) statusProc.running = true }
   Timer {
-    interval: 5000
+    interval: 60000
     repeat: true
     running: root.runtimeDir !== ""
     triggeredOnStart: true
-    onTriggered: if (!statusProc.running) statusProc.running = true
+    onTriggered: root.refreshStatus()
+  }
+  FileView {
+    path: root.runtimeDir !== "" ? root.runtimeDir + "/magic-mouse" : ""
+    preload: false
+    watchChanges: true
+    onFileChanged: root.refreshStatus()
   }
   function parseStatus(content) {
     try {

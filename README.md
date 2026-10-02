@@ -198,10 +198,12 @@ socket, and writes its status under `$XDG_RUNTIME_DIR/magic-mouse/` (an owner-on
   logs `status: not publishing battery status ...` to the journal
   (`journalctl --user -u magic-mouse`), changes nothing there, and keeps
   handling the mouse. The bar widget then falls back to UPower's reading.
-- The bar widget never opens `battery.json` inside the shell. Every 5 seconds it
-  runs `status-reader.py` (shipped with the plugin) as a child process under
-  `timeout`; the child applies the same directory checks, opens the file with
-  `O_NOFOLLOW | O_NONBLOCK`, requires a regular file owned by you, not
+- The bar widget never opens `battery.json` inside the shell. On start, every
+  60 seconds, and whenever the status directory changes (a watch on the
+  directory only, which never opens the file) it runs `status-reader.py`
+  (shipped with the plugin) as a child process under `timeout`; the child
+  applies the same directory checks, opens the file with `O_NOFOLLOW |
+  O_NONBLOCK`, requires a regular file owned by you, not
   group/other-writable and at most 4 KiB (the read itself is capped too), and
   prints the validated JSON, or nothing. A FIFO, symlink, oversized or
   unreadable file therefore costs one short-lived child, never the shell.
