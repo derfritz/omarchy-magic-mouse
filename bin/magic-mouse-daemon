@@ -67,6 +67,7 @@ SCROLL_VEL_MS = 60.0  # smoothing window for the wheel velocity momentum starts 
 # < 2x the mouse's own travel.
 EDGE_MM = 6.0  # a touch that lands this close to the left or right edge is a finger holding the mouse
 MOVE_WINDOW = 0.12  # seconds; "is this finger moving" looks this far back
+GRIP_SLIDE_MM = 2.0  # an edge touch that slides this far sideways within MOVE_WINDOW is a finger after all
 MOVING_MM = 0.5  # travel within MOVE_WINDOW that makes a finger moving rather than resting
 MIN_SLIDE_MM = 1.0  # while the mouse moves, a scroll needs this much slide within MOVE_WINDOW...
 POINTER_RATIO = 3.0  # ...and this many times the distance the mouse itself moved
@@ -975,6 +976,8 @@ class Engine:
                     self.stop_coast("touch")
             else:
                 t.update(ts, x, y)
+                if t.grip and abs(t.recent()[0]) >= GRIP_SLIDE_MM * self.res_x:
+                    t.grip = False  # the hand holding the mouse doesn't slide sideways
 
         fingers = sorted(tid for tid, t in self.touches.items() if not t.grip)
         if not fingers:
@@ -1004,6 +1007,12 @@ class Engine:
             self.primary = None
             self.stop_coast("touch")
         self.max_fingers = max(self.max_fingers, len(fingers))
+        if self.scrolling and self.axis == "x" and len(self.primary) == 1 and self.second_finger_joined(fingers):
+            # fingers rarely start together: drop the one-finger scroll (no page
+            # swipe on lift) and let pick() see the pair
+            self.scrolling = False
+            self.primary = None
+            self.t_ref = None
         key = self.pick(fingers)
         if key is None:
             if self.scrolling:
@@ -1016,6 +1025,16 @@ class Engine:
         x = sum(self.touches[t].x for t in key) / len(key)
         y = sum(self.touches[t].y for t in key) / len(key)
         self.follow(ts, key, x, y)
+
+    def second_finger_joined(self, fingers: list[int]) -> bool:
+        lead = self.touches.get(self.primary[0])
+        if lead is None:
+            return False
+        lead_dx = lead.recent()[0]
+        return any(
+            dx * lead_dx > 0 and abs(dx) >= MOVING_MM * self.res_x
+            for dx in (self.touches[t].recent()[0] for t in fingers if t != self.primary[0])
+        )
 
     def pick(self, fingers: list[int]) -> tuple[int, ...] | None:
         """The finger(s) to follow: a scroll in progress keeps its own; otherwise the
@@ -1103,7 +1122,7 @@ class Engine:
             elif math.hypot(dx_mm, dy_mm) < float(s["start_mm"]) or self.key_recent_mm(key) < MOVING_MM:
                 return  # not far enough yet, or only creeping: a resting finger rolls and drifts slowly
             self.axis = "x" if abs(dx_mm) > HORIZONTAL_RATIO * abs(dy_mm) else "y"
-            if self.axis == "x" and (not s["horizontal"] or len(key) == 2):
+            if self.gesture_fired or (self.axis == "x" and (not s["horizontal"] or len(key) == 2)):
                 self.t_ref = (x, y)  # sideways with two fingers is the workspace gesture
                 return
             self.scrolling = True
