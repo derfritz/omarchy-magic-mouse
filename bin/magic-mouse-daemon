@@ -1280,6 +1280,10 @@ def run_session(dev: InputDevice, ui: UInput, eng: Engine, cfg_path: str, hypr: 
                         eng.control_click(time.time())
                     elif line.startswith("configreloaded>>"):
                         hypr.resync()  # a reload drops bindings added at runtime
+                    elif line.startswith("activewindowv2>>"):
+                        # wheel events go to the window under the pointer, so a glide
+                        # would carry on into whatever window gets focus next
+                        eng.stop_coast("focus")
             if eng.coasting:
                 eng.tick(time.time())
             if now >= next_cfg_check:
